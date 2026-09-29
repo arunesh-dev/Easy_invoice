@@ -5,15 +5,12 @@ import Dexie, { type Table } from 'dexie'
 export type SyncState = 'synced' | 'pending' | 'error'
 
 export interface SyncMeta {
-  /** 'synced' = server matches local; 'pending' = outbox has work; 'error' = last write failed */
   _syncState: SyncState
-  /** Local timestamp of last mutation — used for UI ordering while offline */
   _localUpdatedAt: number
-  /** Last sync error message, if any */
   _lastError?: string
 }
 
-// ---------- Entities (mirror Firestore, plus local fields) ----------
+// ---------- Entities ----------
 
 export interface DbBusiness {
   id: string
@@ -42,7 +39,7 @@ export interface DbProduct extends SyncMeta {
   id: string
   businessId: string
   name: string
-  unit: string          // e.g. 'piece', 'cft', 'load'
+  unit: string
   price: number
   category?: string
   isActive: boolean
@@ -100,16 +97,6 @@ export interface DbExpense extends SyncMeta {
   note?: string
 }
 
-// ---------- Settings (local-only) ----------
-
-export interface DbSettings {
-  businessId: string
-  invoicePrefix: string       // e.g. 'SRM'
-  lastInvoiceNumber: number   // last used; next = this + 1
-}
-
-// ---------- Outbox ----------
-
 export type EntityName =
   | 'businesses'
   | 'customers'
@@ -121,20 +108,23 @@ export type EntityName =
 export type OutboxOp = 'upsert' | 'delete'
 
 export interface OutboxEntry {
-  /** Auto-increment primary key. Preserves FIFO order. */
   id?: number
-  /** `${entity}:${entityId}` — indexed so dedupe lookup is O(1). */
   key: string
   entity: EntityName
   entityId: string
   businessId: string
   op: OutboxOp
-  /** Full doc snapshot for upsert. Undefined for delete. */
   payload?: Record<string, unknown>
   createdAt: number
   attempts: number
   status: 'pending' | 'failed'
   lastError?: string
+}
+
+export interface DbSettings {
+  businessId: string
+  invoicePrefix: string
+  lastInvoiceNumber: number
 }
 
 // ---------- Database ----------
@@ -151,17 +141,58 @@ export class AppDb extends Dexie {
 
   constructor() {
     super('sriram-hollow-bricks')
+
+    // Version 1: initial schema
     this.version(1).stores({
       businesses: 'id, ownerUid',
-      customers:  'id, businessId, [businessId+name], phone, _syncState',
-      products:   'id, businessId, [businessId+name], isActive, category, _syncState',
-      invoices:   'id, businessId, customerId, [businessId+issuedAt], status, _syncState',
-      payments:   'id, businessId, invoiceId, [businessId+date], _syncState',
-      expenses:   'id, businessId, category, [businessId+date], _syncState',
-      outbox:     '++id, key, businessId, status, createdAt',
+      customers: 'id, businessId, [businessId+name], phone, _syncState',
+      products: 'id, businessId, [businessId+name], isActive, category, _syncState',
+      invoices: 'id, businessId, customerId, [businessId+issuedAt], status, _syncState',
+      payments: 'id, businessId, invoiceId, [businessId+date], _syncState',
+      expenses: 'id, businessId, category, [businessId+date], _syncState',
+      outbox: '++id, key, businessId, status, createdAt',
     })
+
+    // Version 2: add settings table (local-only invoice counter)
     this.version(2).stores({
       settings: 'businessId',
+    })
+
+    // Version 3: re-declare ALL tables. Fixes a schema mismatch that 
+    // caused Dexie to silently delete the database on every open.
+    this.version(3).stores({
+      businesses: 'id, ownerUid',
+      customers: 'id, businessId, [businessId+name], phone, _syncState',
+      products: 'id, businessId, [businessId+name], isActive, category, _syncState',
+      invoices: 'id, businessId, customerId, [businessId+issuedAt], status, _syncState',
+      payments: 'id, businessId, invoiceId, [businessId+date], _syncState',
+      expenses: 'id, businessId, category, [businessId+date], _syncState',
+      outbox: '++id, key, businessId, status, createdAt',
+      settings: 'businessId',
+    })
+
+    // ---- Diagnostics: log when the DB is created or deleted ----
+
+    this.on('populate', () => {
+      console.warn(
+        '[Dexie] Database was EMPTY and is being populated. ' +
+        'If you see this on every refresh, the DB is being deleted.'
+      )
+    })
+
+    this.on('versionchange', (event) => {
+      console.warn(
+        '[Dexie] versionchange event:',
+        'oldVersion=', (event as any).oldVersion,
+        'newVersion=', (event as any).newVersion
+      )
+    })
+
+    this.on('blocked', () => {
+      console.error(
+        '[Dexie] Database open was BLOCKED by another tab. ' +
+        'Close other tabs running this app.'
+      )
     })
   }
 }
